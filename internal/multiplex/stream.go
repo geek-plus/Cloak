@@ -2,156 +2,238 @@ package multiplex
 
 import (
 	"errors"
-	//"log"
-	"math"
-	prand "math/rand"
+	"io"
+	"net"
+	"time"
+
+	log "github.com/sirupsen/logrus"
 	"sync"
 	"sync/atomic"
 )
 
 var ErrBrokenStream = errors.New("broken stream")
 
+// Stream implements net.Conn. It represents an optionally-ordered, full-duplex, self-contained connection.
+// If the session it belongs to runs in ordered mode, it provides ordering guarantee regardless of the underlying
+// connection used.
+// If the underlying connections the session uses are reliable, Stream is reliable. If they are not, Stream does not
+// guarantee reliability.
 type Stream struct {
 	id uint32
 
 	session *Session
 
-	// Explanations of the following 4 fields can be found in frameSorter.go
-	nextRecvSeq uint32
-	rev         int
-	sh          sorterHeap
-	wrapMode    bool
+	// a buffer (implemented as an asynchronous buffered pipe) to put data we've received from recvFrame but hasn't
+	// been read by the consumer through Read or WriteTo
+	recvBuf recvBuffer
 
-	// New frames are received through newFrameCh by frameSorter
-	newFrameCh chan *Frame
-	// sortedBufCh are order-sorted data ready to be read raw
-	sortedBufCh chan []byte
+	nextSendSeq uint64
+
+	writingM sync.Mutex
 
 	// atomic
-	nextSendSeq uint32
+	closed uint32
 
-	writingM sync.RWMutex
+	// lazy allocation for obfsBuf. This is desirable because obfsBuf is only used when data is sent from
+	// the stream (through Write or ReadFrom). Some streams never send data so eager allocation will waste
+	// memory
+	allocIdempot sync.Once
+	// obfuscation happens in this buffer
+	obfsBuf []byte
 
-	// close(die) is used to notify different goroutines that this stream is closing
-	die        chan struct{}
-	heliumMask sync.Once // my personal fav
+	// When we want order guarantee (i.e. session.Unordered is false),
+	// we assign each stream a fixed underlying connection.
+	// If the underlying connections the session uses provide ordering guarantee (most likely TCP),
+	// recvBuffer (implemented by streamBuffer under ordered mode) will not receive out-of-order packets
+	// so it won't have to use its priority queue to sort it.
+	// This is not used in unordered connection mode
+	assignedConnId uint32
+
+	readFromTimeout time.Duration
 }
 
-func makeStream(id uint32, sesh *Session) *Stream {
-	stream := &Stream{
-		id:          id,
-		session:     sesh,
-		die:         make(chan struct{}),
-		sh:          []*frameNode{},
-		newFrameCh:  make(chan *Frame, 1024),
-		sortedBufCh: make(chan []byte, 1024),
+func makeStream(sesh *Session, id uint32) *Stream {
+	var recvBuf recvBuffer
+	if sesh.Unordered {
+		recvBuf = NewDatagramBufferedPipe()
+	} else {
+		recvBuf = NewStreamBuffer()
 	}
-	go stream.recvNewFrame()
+
+	stream := &Stream{
+		id:      id,
+		session: sesh,
+		recvBuf: recvBuf,
+	}
+
 	return stream
 }
 
-func (stream *Stream) Read(buf []byte) (n int, err error) {
+func (s *Stream) isClosed() bool { return atomic.LoadUint32(&s.closed) == 1 }
+
+// receive a readily deobfuscated Frame so its payload can later be Read
+func (s *Stream) recvFrame(frame Frame) error {
+	toBeClosed, err := s.recvBuf.Write(frame)
+	if toBeClosed {
+		err = s.passiveClose()
+		if errors.Is(err, errRepeatStreamClosing) {
+			log.Debug(err)
+			return nil
+		}
+		return err
+	}
+	return err
+}
+
+// Read implements io.Read
+func (s *Stream) Read(buf []byte) (n int, err error) {
+	//log.Tracef("attempting to read from stream %v", s.id)
 	if len(buf) == 0 {
-		select {
-		case <-stream.die:
-			return 0, ErrBrokenStream
-		default:
-			return 0, nil
-		}
-	}
-	select {
-	case <-stream.die:
-		return 0, ErrBrokenStream
-	case data := <-stream.sortedBufCh:
-		if len(data) == 0 {
-			stream.passiveClose()
-			return 0, ErrBrokenStream
-		}
-		if len(buf) < len(data) {
-			return 0, errors.New("buf too small")
-		}
-		copy(buf, data)
-		return len(data), nil
+		return 0, nil
 	}
 
-}
-
-func (stream *Stream) Write(in []byte) (n int, err error) {
-	// RWMutex used here isn't really for RW.
-	// we use it to exploit the fact that RLock doesn't create contention.
-	// The use of RWMutex is so that the stream will not actively close
-	// in the middle of the execution of Write. This may cause the closing frame
-	// to be sent before the data frame and cause loss of packet.
-	stream.writingM.RLock()
-	select {
-	case <-stream.die:
-		stream.writingM.RUnlock()
-		return 0, ErrBrokenStream
-	default:
+	n, err = s.recvBuf.Read(buf)
+	log.Tracef("%v read from stream %v with err %v", n, s.id, err)
+	if err == io.EOF {
+		return n, ErrBrokenStream
 	}
-
-	f := &Frame{
-		StreamID: stream.id,
-		Seq:      atomic.AddUint32(&stream.nextSendSeq, 1) - 1,
-		Closing:  0,
-		Payload:  in,
-	}
-
-	tlsRecord, err := stream.session.obfs(f)
-	if err != nil {
-		stream.writingM.RUnlock()
-		return 0, err
-	}
-	n, err = stream.session.sb.send(tlsRecord)
-	stream.writingM.RUnlock()
-
 	return
-
 }
 
-// only close locally. Used when the stream close is notified by the remote
-func (stream *Stream) passiveClose() {
-	stream.heliumMask.Do(func() { close(stream.die) })
-	stream.session.delStream(stream.id)
-	//log.Printf("%v passive closing\n", stream.id)
+// WriteTo continuously write data Stream has received into the writer w.
+func (s *Stream) WriteTo(w io.Writer) (int64, error) {
+	// will keep writing until the underlying buffer is closed
+	n, err := s.recvBuf.WriteTo(w)
+	log.Tracef("%v read from stream %v with err %v", n, s.id, err)
+	if err == io.EOF {
+		return n, ErrBrokenStream
+	}
+	return n, nil
 }
 
-// active close. Close locally and tell the remote that this stream is being closed
-func (stream *Stream) Close() error {
-
-	stream.writingM.Lock()
-	select {
-	case <-stream.die:
-		stream.writingM.Unlock()
-		return errors.New("Already Closed")
-	default:
+func (s *Stream) obfuscateAndSend(f *Frame, payloadOffsetInObfsBuf int) error {
+	var cipherTextLen int
+	cipherTextLen, err := s.session.Obfs(f, s.obfsBuf, payloadOffsetInObfsBuf)
+	if err != nil {
+		return err
 	}
-	stream.heliumMask.Do(func() { close(stream.die) })
 
-	// Notify remote that this stream is closed
-	prand.Seed(int64(stream.id))
-	padLen := int(math.Floor(prand.Float64()*200 + 300))
-	pad := make([]byte, padLen)
-	prand.Read(pad)
-	f := &Frame{
-		StreamID: stream.id,
-		Seq:      atomic.AddUint32(&stream.nextSendSeq, 1) - 1,
-		Closing:  1,
-		Payload:  pad,
+	_, err = s.session.sb.send(s.obfsBuf[:cipherTextLen], &s.assignedConnId)
+	log.Tracef("%v sent to remote through stream %v with err %v. seq: %v", len(f.Payload), s.id, err, f.Seq)
+	if err != nil {
+		if err == errBrokenSwitchboard {
+			s.session.SetTerminalMsg(err.Error())
+			s.session.passiveClose()
+		}
+		return err
 	}
-	tlsRecord, _ := stream.session.obfs(f)
-	stream.session.sb.send(tlsRecord)
-
-	stream.session.delStream(stream.id)
-	//log.Printf("%v actively closed\n", stream.id)
-	stream.writingM.Unlock()
 	return nil
 }
 
-// Same as passiveClose() but no call to session.delStream.
-// This is called in session.Close() to avoid mutex deadlock
-// We don't notify the remote because session.Close() is always
-// called when the session is passively closed
-func (stream *Stream) closeNoDelMap() {
-	stream.heliumMask.Do(func() { close(stream.die) })
+// Write implements io.Write
+func (s *Stream) Write(in []byte) (n int, err error) {
+	s.writingM.Lock()
+	defer s.writingM.Unlock()
+	if s.isClosed() {
+		return 0, ErrBrokenStream
+	}
+
+	if s.obfsBuf == nil {
+		s.obfsBuf = make([]byte, s.session.StreamSendBufferSize)
+	}
+	for n < len(in) {
+		var framePayload []byte
+		if len(in)-n <= s.session.maxStreamUnitWrite {
+			// if we can fit remaining data of in into one frame
+			framePayload = in[n:]
+		} else {
+			// if we have to split
+			if s.session.Unordered {
+				// but we are not allowed to
+				err = io.ErrShortBuffer
+				return
+			}
+			framePayload = in[n : s.session.maxStreamUnitWrite+n]
+		}
+		f := &Frame{
+			StreamID: s.id,
+			Seq:      s.nextSendSeq,
+			Closing:  C_NOOP,
+			Payload:  framePayload,
+		}
+		s.nextSendSeq++
+		err = s.obfuscateAndSend(f, 0)
+		if err != nil {
+			return
+		}
+		n += len(framePayload)
+	}
+	return
 }
+
+// ReadFrom continuously read data from r and send it off, until either r returns error or nothing has been read
+// for readFromTimeout amount of time
+func (s *Stream) ReadFrom(r io.Reader) (n int64, err error) {
+	if s.obfsBuf == nil {
+		s.obfsBuf = make([]byte, s.session.StreamSendBufferSize)
+	}
+	for {
+		if s.readFromTimeout != 0 {
+			if rder, ok := r.(net.Conn); !ok {
+				log.Warn("ReadFrom timeout is set but reader doesn't implement SetReadDeadline")
+			} else {
+				rder.SetReadDeadline(time.Now().Add(s.readFromTimeout))
+			}
+		}
+		read, er := r.Read(s.obfsBuf[HEADER_LEN : HEADER_LEN+s.session.maxStreamUnitWrite])
+		if er != nil {
+			return n, er
+		}
+		if s.isClosed() {
+			return n, ErrBrokenStream
+		}
+
+		s.writingM.Lock()
+		f := &Frame{
+			StreamID: s.id,
+			Seq:      s.nextSendSeq,
+			Closing:  C_NOOP,
+			Payload:  s.obfsBuf[HEADER_LEN : HEADER_LEN+read],
+		}
+		s.nextSendSeq++
+		err = s.obfuscateAndSend(f, HEADER_LEN)
+		s.writingM.Unlock()
+
+		if err != nil {
+			return
+		}
+		n += int64(read)
+	}
+}
+
+func (s *Stream) passiveClose() error {
+	return s.session.closeStream(s, false)
+}
+
+// active close. Close locally and tell the remote that this stream is being closed
+func (s *Stream) Close() error {
+	s.writingM.Lock()
+	defer s.writingM.Unlock()
+
+	return s.session.closeStream(s, true)
+}
+
+func (s *Stream) LocalAddr() net.Addr  { return s.session.addrs.Load().([]net.Addr)[0] }
+func (s *Stream) RemoteAddr() net.Addr { return s.session.addrs.Load().([]net.Addr)[1] }
+
+func (s *Stream) SetWriteToTimeout(d time.Duration)  { s.recvBuf.SetWriteToTimeout(d) }
+func (s *Stream) SetReadDeadline(t time.Time) error  { s.recvBuf.SetReadDeadline(t); return nil }
+func (s *Stream) SetReadFromTimeout(d time.Duration) { s.readFromTimeout = d }
+
+var errNotImplemented = errors.New("Not implemented")
+
+// the following functions are purely for implementing net.Conn interface.
+// they are not used
+// TODO: implement the following
+func (s *Stream) SetDeadline(t time.Time) error      { return errNotImplemented }
+func (s *Stream) SetWriteDeadline(t time.Time) error { return errNotImplemented }

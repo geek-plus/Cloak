@@ -3,123 +3,65 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"flag"
 	"fmt"
-	"io"
-	"log"
-	"math/rand"
+	"github.com/cbeuw/Cloak/internal/common"
 	"net"
 	"os"
-	"sync"
-	"time"
 
 	"github.com/cbeuw/Cloak/internal/client"
-	"github.com/cbeuw/Cloak/internal/client/TLS"
 	mux "github.com/cbeuw/Cloak/internal/multiplex"
-	"github.com/cbeuw/Cloak/internal/util"
+	log "github.com/sirupsen/logrus"
 )
 
 var version string
 
-func pipe(dst io.ReadWriteCloser, src io.ReadWriteCloser) {
-	// The maximum size of TLS message will be 16396+12. 12 because of the stream header
-	// 16408 is the max TLS message size on Firefox
-	buf := make([]byte, 16396)
-	for {
-		i, err := io.ReadAtLeast(src, buf, 1)
-		if err != nil {
-			go dst.Close()
-			go src.Close()
-			return
-		}
-		i, err = dst.Write(buf[:i])
-		if err != nil {
-			go dst.Close()
-			go src.Close()
-			return
-		}
-	}
-}
-
-// This establishes a connection with ckserver and performs a handshake
-func makeRemoteConn(sta *client.State) (net.Conn, error) {
-
-	// For android
-	d := net.Dialer{Control: protector}
-
-	clientHello := TLS.ComposeInitHandshake(sta)
-	connectingIP := sta.SS_REMOTE_HOST
-	if net.ParseIP(connectingIP).To4() == nil {
-		// IPv6 needs square brackets
-		connectingIP = "[" + connectingIP + "]"
-	}
-	remoteConn, err := d.Dial("tcp", connectingIP+":"+sta.SS_REMOTE_PORT)
-	if err != nil {
-		log.Printf("Connecting to remote: %v\n", err)
-		return nil, err
-	}
-	_, err = remoteConn.Write(clientHello)
-	if err != nil {
-		log.Printf("Sending ClientHello: %v\n", err)
-		return nil, err
-	}
-
-	// Three discarded messages: ServerHello, ChangeCipherSpec and Finished
-	discardBuf := make([]byte, 1024)
-	for c := 0; c < 3; c++ {
-		_, err = util.ReadTLS(remoteConn, discardBuf)
-		if err != nil {
-			log.Printf("Reading discarded message %v: %v\n", c, err)
-			return nil, err
-		}
-	}
-
-	reply := TLS.ComposeReply()
-	_, err = remoteConn.Write(reply)
-	if err != nil {
-		log.Printf("Sending reply to remote: %v\n", err)
-		return nil, err
-	}
-
-	return remoteConn, nil
-
-}
-
 func main() {
-	// Should be 127.0.0.1 to listen to ss-local on this machine
+	// Should be 127.0.0.1 to listen to a proxy client on this machine
 	var localHost string
-	// server_port in ss config, ss sends data on loopback using this port
+	// port used by proxy clients to communicate with cloak client
 	var localPort string
 	// The ip of the proxy server
 	var remoteHost string
 	// The proxy port,should be 443
 	var remotePort string
-	var pluginOpts string
-	isAdmin := new(bool)
-
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	var proxyMethod string
+	var udp bool
+	var config string
+	var b64AdminUID string
+	var vpnMode bool
+	var tcpFastOpen bool
 
 	log_init()
 
-	if os.Getenv("SS_LOCAL_HOST") != "" {
-		localHost = os.Getenv("SS_LOCAL_HOST")
-		localPort = os.Getenv("SS_LOCAL_PORT")
-		remoteHost = os.Getenv("SS_REMOTE_HOST")
-		remotePort = os.Getenv("SS_REMOTE_PORT")
-		pluginOpts = os.Getenv("SS_PLUGIN_OPTIONS")
+	ssPluginMode := os.Getenv("SS_LOCAL_HOST") != ""
+
+	verbosity := flag.String("verbosity", "info", "verbosity level")
+	if ssPluginMode {
+		config = os.Getenv("SS_PLUGIN_OPTIONS")
+		flag.BoolVar(&vpnMode, "V", false, "ignored.")
+		flag.BoolVar(&tcpFastOpen, "fast-open", false, "ignored.")
+		flag.Parse() // for verbosity only
 	} else {
-		localHost = "127.0.0.1"
-		flag.StringVar(&localPort, "l", "", "localPort: same as server_port in ss config, the plugin listens to SS using this")
+		flag.StringVar(&localHost, "i", "127.0.0.1", "localHost: Cloak listens to proxy clients on this ip")
+		flag.StringVar(&localPort, "l", "1984", "localPort: Cloak listens to proxy clients on this port")
 		flag.StringVar(&remoteHost, "s", "", "remoteHost: IP of your proxy server")
 		flag.StringVar(&remotePort, "p", "443", "remotePort: proxy port, should be 443")
-		flag.StringVar(&pluginOpts, "c", "ckclient.json", "pluginOpts: path to ckclient.json or options seperated with semicolons")
+		flag.BoolVar(&udp, "u", false, "udp: set this flag if the underlying proxy is using UDP protocol")
+		flag.StringVar(&config, "c", "ckclient.json", "config: path to the configuration file or options separated with semicolons")
+		flag.StringVar(&proxyMethod, "proxy", "", "proxy: the proxy method's name. It must match exactly with the corresponding entry in server's ProxyBook")
+		flag.StringVar(&b64AdminUID, "a", "", "adminUID: enter the adminUID to serve the admin api")
 		askVersion := flag.Bool("v", false, "Print the version number")
-		isAdmin = flag.Bool("a", false, "Admin mode")
 		printUsage := flag.Bool("h", false, "Print this message")
+
+		// commandline arguments overrides json
+
 		flag.Parse()
 
 		if *askVersion {
-			fmt.Printf("ck-client %s\n", version)
+			fmt.Printf("ck-client %s", version)
 			return
 		}
 
@@ -128,114 +70,124 @@ func main() {
 			return
 		}
 
-		log.Println("Starting standalone mode")
+		log.Info("Starting standalone mode")
 	}
 
-	if *isAdmin {
-		sta := client.InitState("", "", "", "", time.Now)
-		err := sta.ParseConfig(pluginOpts)
+	lvl, err := log.ParseLevel(*verbosity)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.SetLevel(lvl)
+
+	rawConfig, err := client.ParseConfig(config)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if ssPluginMode {
+		rawConfig.ProxyMethod = "shadowsocks"
+		// json takes precedence over environment variables
+		// i.e. if json field isn't empty, use that
+		if rawConfig.RemoteHost == "" {
+			rawConfig.RemoteHost = os.Getenv("SS_REMOTE_HOST")
+		}
+		if rawConfig.RemotePort == "" {
+			rawConfig.RemotePort = os.Getenv("SS_REMOTE_PORT")
+		}
+		if rawConfig.LocalHost == "" {
+			rawConfig.LocalHost = os.Getenv("SS_LOCAL_HOST")
+		}
+		if rawConfig.LocalPort == "" {
+			rawConfig.LocalPort = os.Getenv("SS_LOCAL_PORT")
+		}
+	} else {
+		// commandline argument takes precedence over json
+		// if commandline argument is set, use commandline
+		flag.Visit(func(f *flag.Flag) {
+			// manually set ones
+			switch f.Name {
+			case "i":
+				rawConfig.LocalHost = localHost
+			case "l":
+				rawConfig.LocalPort = localPort
+			case "s":
+				rawConfig.RemoteHost = remoteHost
+			case "p":
+				rawConfig.RemotePort = remotePort
+			case "u":
+				rawConfig.UDP = udp
+			case "proxy":
+				rawConfig.ProxyMethod = proxyMethod
+			}
+		})
+		// ones with default values
+		if rawConfig.LocalHost == "" {
+			rawConfig.LocalHost = localHost
+		}
+		if rawConfig.LocalPort == "" {
+			rawConfig.LocalPort = localPort
+		}
+		if rawConfig.RemotePort == "" {
+			rawConfig.RemotePort = remotePort
+		}
+	}
+
+	localConfig, remoteConfig, authInfo, err := rawConfig.ProcessRawConfig(common.RealWorldState)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var adminUID []byte
+	if b64AdminUID != "" {
+		adminUID, err = base64.StdEncoding.DecodeString(b64AdminUID)
 		if err != nil {
 			log.Fatal(err)
 		}
-		err = adminPrompt(sta)
+	}
+
+	var seshMaker func() *mux.Session
+
+	d := &net.Dialer{Control: protector, KeepAlive: remoteConfig.KeepAlive}
+
+	if adminUID != nil {
+		log.Infof("API base is %v", localConfig.LocalAddr)
+		authInfo.UID = adminUID
+		authInfo.SessionId = 0
+		remoteConfig.NumConn = 1
+
+		seshMaker = func() *mux.Session {
+			return client.MakeSession(remoteConfig, authInfo, d)
+		}
+	} else {
+		var network string
+		if authInfo.Unordered {
+			network = "UDP"
+		} else {
+			network = "TCP"
+		}
+		log.Infof("Listening on %v %v for %v client", network, localConfig.LocalAddr, authInfo.ProxyMethod)
+		seshMaker = func() *mux.Session {
+			// sessionID is usergenerated. There shouldn't be a security concern because the scope of
+			// sessionID is limited to its UID.
+			quad := make([]byte, 4)
+			common.RandRead(authInfo.WorldState.Rand, quad)
+			authInfo.SessionId = binary.BigEndian.Uint32(quad)
+			return client.MakeSession(remoteConfig, authInfo, d)
+		}
+	}
+
+	if authInfo.Unordered {
+		acceptor := func() (*net.UDPConn, error) {
+			udpAddr, _ := net.ResolveUDPAddr("udp", localConfig.LocalAddr)
+			return net.ListenUDP("udp", udpAddr)
+		}
+
+		client.RouteUDP(acceptor, localConfig.Timeout, seshMaker)
+	} else {
+		listener, err := net.Listen("tcp", localConfig.LocalAddr)
 		if err != nil {
-			log.Println(err)
+			log.Fatal(err)
 		}
-		return
+		client.RouteTCP(listener, localConfig.Timeout, seshMaker)
 	}
-
-	sta := client.InitState(localHost, localPort, remoteHost, remotePort, time.Now)
-	err := sta.ParseConfig(pluginOpts)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if sta.SS_LOCAL_PORT == "" {
-		log.Fatal("Must specify localPort")
-	}
-	if sta.SS_REMOTE_HOST == "" {
-		log.Fatal("Must specify remoteHost")
-	}
-	if sta.TicketTimeHint == 0 {
-		log.Fatal("TicketTimeHint cannot be empty or 0")
-	}
-	listeningIP := sta.SS_LOCAL_HOST
-	if net.ParseIP(listeningIP).To4() == nil {
-		// IPv6 needs square brackets
-		listeningIP = "[" + listeningIP + "]"
-	}
-	listener, err := net.Listen("tcp", listeningIP+":"+sta.SS_LOCAL_PORT)
-	log.Println("Listening for ss on " + listeningIP + ":" + sta.SS_LOCAL_PORT)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-start:
-	log.Println("Attemtping to start a new session")
-	// sessionID is usergenerated. There shouldn't be a security concern because the scope of
-	// sessionID is limited to its UID.
-	rand.Seed(time.Now().UnixNano())
-	sessionID := rand.Uint32()
-	sta.SetSessionID(sessionID)
-	var UNLIMITED_DOWN int64 = 1e15
-	var UNLIMITED_UP int64 = 1e15
-	valve := mux.MakeValve(1e12, 1e12, &UNLIMITED_DOWN, &UNLIMITED_UP)
-	obfs := mux.MakeObfs(sta.UID)
-	deobfs := mux.MakeDeobfs(sta.UID)
-	sesh := mux.MakeSession(sessionID, valve, obfs, deobfs, util.ReadTLS)
-
-	var wg sync.WaitGroup
-	for i := 0; i < sta.NumConn; i++ {
-		wg.Add(1)
-		go func() {
-		makeconn:
-			conn, err := makeRemoteConn(sta)
-			if err != nil {
-				log.Printf("Failed to establish new connections to remote: %v\n", err)
-				time.Sleep(time.Second * 3)
-				goto makeconn
-			}
-			sesh.AddConnection(conn)
-			wg.Done()
-		}()
-	}
-	wg.Wait()
-
-	log.Printf("Session %v established", sessionID)
-
-	for {
-		if sesh.IsBroken() {
-			goto start
-		}
-		ssConn, err := listener.Accept()
-		if err != nil {
-			log.Println(err)
-			continue
-		}
-		go func() {
-			data := make([]byte, 10240)
-			i, err := io.ReadAtLeast(ssConn, data, 1)
-			if err != nil {
-				log.Println(err)
-				ssConn.Close()
-				return
-			}
-			stream, err := sesh.OpenStream()
-			if err != nil {
-				log.Println(err)
-				ssConn.Close()
-				return
-			}
-			_, err = stream.Write(data[:i])
-			if err != nil {
-				log.Println(err)
-				ssConn.Close()
-				stream.Close()
-				return
-			}
-			go pipe(ssConn, stream)
-			pipe(stream, ssConn)
-		}()
-	}
-
 }

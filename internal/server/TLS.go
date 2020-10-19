@@ -1,166 +1,96 @@
 package server
 
 import (
-	"encoding/binary"
+	"crypto"
 	"errors"
-	"time"
+	"fmt"
+	"github.com/cbeuw/Cloak/internal/common"
+	"github.com/cbeuw/Cloak/internal/ecdh"
+	"io"
+	"math/rand"
+	"net"
 
-	"github.com/cbeuw/Cloak/internal/util"
+	log "github.com/sirupsen/logrus"
 )
 
-// ClientHello contains every field in a ClientHello message
-type ClientHello struct {
-	handshakeType         byte
-	length                int
-	clientVersion         []byte
-	random                []byte
-	sessionIdLen          int
-	sessionId             []byte
-	cipherSuitesLen       int
-	cipherSuites          []byte
-	compressionMethodsLen int
-	compressionMethods    []byte
-	extensionsLen         int
-	extensions            map[[2]byte][]byte
-}
+const appDataMaxLength = 16401
 
-var u16 = binary.BigEndian.Uint16
-var u32 = binary.BigEndian.Uint32
+type TLS struct{}
 
-func parseExtensions(input []byte) (ret map[[2]byte][]byte, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = errors.New("Malformed Extensions")
-		}
-	}()
-	pointer := 0
-	totalLen := len(input)
-	ret = make(map[[2]byte][]byte)
-	for pointer < totalLen {
-		var typ [2]byte
-		copy(typ[:], input[pointer:pointer+2])
-		pointer += 2
-		length := int(u16(input[pointer : pointer+2]))
-		pointer += 2
-		data := input[pointer : pointer+length]
-		pointer += length
-		ret[typ] = data
+var ErrBadClientHello = errors.New("non (or malformed) ClientHello")
+
+func (TLS) String() string { return "TLS" }
+
+func (TLS) processFirstPacket(clientHello []byte, privateKey crypto.PrivateKey) (fragments authFragments, respond Responder, err error) {
+	ch, err := parseClientHello(clientHello)
+	if err != nil {
+		log.Debug(err)
+		err = ErrBadClientHello
+		return
 	}
-	return ret, err
-}
 
-// AddRecordLayer adds record layer to data
-func AddRecordLayer(input []byte, typ []byte, ver []byte) []byte {
-	length := make([]byte, 2)
-	binary.BigEndian.PutUint16(length, uint16(len(input)))
-	ret := make([]byte, 5+len(input))
-	copy(ret[0:1], typ)
-	copy(ret[1:3], ver)
-	copy(ret[3:5], length)
-	copy(ret[5:], input)
-	return ret
-}
+	fragments, err = TLS{}.unmarshalClientHello(ch, privateKey)
+	if err != nil {
+		err = fmt.Errorf("failed to unmarshal ClientHello into authFragments: %v", err)
+		return
+	}
 
-// PeelRecordLayer peels off the record layer
-func PeelRecordLayer(data []byte) []byte {
-	ret := data[5:]
-	return ret
-}
+	respond = TLS{}.makeResponder(ch.sessionId, fragments.sharedSecret)
 
-// ParseClientHello parses everything on top of the TLS layer
-// (including the record layer) into ClientHello type
-func ParseClientHello(data []byte) (ret *ClientHello, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = errors.New("Malformed ClientHello")
-		}
-	}()
-	data = PeelRecordLayer(data)
-	pointer := 0
-	// Handshake Type
-	handshakeType := data[pointer]
-	if handshakeType != 0x01 {
-		return ret, errors.New("Not a ClientHello")
-	}
-	pointer += 1
-	// Length
-	length := int(u32(append([]byte{0x00}, data[pointer:pointer+3]...)))
-	pointer += 3
-	if length != len(data[pointer:]) {
-		return ret, errors.New("Hello length doesn't match")
-	}
-	// Client Version
-	clientVersion := data[pointer : pointer+2]
-	pointer += 2
-	// Random
-	random := data[pointer : pointer+32]
-	pointer += 32
-	// Session ID
-	sessionIdLen := int(data[pointer])
-	pointer += 1
-	sessionId := data[pointer : pointer+sessionIdLen]
-	pointer += sessionIdLen
-	// Cipher Suites
-	cipherSuitesLen := int(u16(data[pointer : pointer+2]))
-	pointer += 2
-	cipherSuites := data[pointer : pointer+cipherSuitesLen]
-	pointer += cipherSuitesLen
-	// Compression Methods
-	compressionMethodsLen := int(data[pointer])
-	pointer += 1
-	compressionMethods := data[pointer : pointer+compressionMethodsLen]
-	pointer += compressionMethodsLen
-	// Extensions
-	extensionsLen := int(u16(data[pointer : pointer+2]))
-	pointer += 2
-	extensions, err := parseExtensions(data[pointer:])
-	ret = &ClientHello{
-		handshakeType,
-		length,
-		clientVersion,
-		random,
-		sessionIdLen,
-		sessionId,
-		cipherSuitesLen,
-		cipherSuites,
-		compressionMethodsLen,
-		compressionMethods,
-		extensionsLen,
-		extensions,
-	}
 	return
 }
 
-func composeServerHello(ch *ClientHello) []byte {
-	var serverHello [10][]byte
-	serverHello[0] = []byte{0x02}                                   // handshake type
-	serverHello[1] = []byte{0x00, 0x00, 0x4d}                       // length 77
-	serverHello[2] = []byte{0x03, 0x03}                             // server version
-	serverHello[3] = util.PsudoRandBytes(32, time.Now().UnixNano()) // random
-	serverHello[4] = []byte{0x20}                                   // session id length 32
-	serverHello[5] = ch.sessionId                                   // session id
-	serverHello[6] = []byte{0xc0, 0x30}                             // cipher suite TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-	serverHello[7] = []byte{0x00}                                   // compression method null
-	serverHello[8] = []byte{0x00, 0x05}                             // extensions length 5
-	serverHello[9] = []byte{0xff, 0x01, 0x00, 0x01, 0x00}           // extensions renegotiation_info
-	ret := []byte{}
-	for i := 0; i < 10; i++ {
-		ret = append(ret, serverHello[i]...)
+func (TLS) makeResponder(clientHelloSessionId []byte, sharedSecret [32]byte) Responder {
+	respond := func(originalConn net.Conn, sessionKey [32]byte, randSource io.Reader) (preparedConn net.Conn, err error) {
+		// the cert length needs to be the same for all handshakes belonging to the same session
+		// we can use sessionKey as a seed here to ensure consistency
+		possibleCertLengths := []int{42, 27, 68, 59, 36, 44, 46}
+		rand.Seed(int64(sessionKey[0]))
+		cert := make([]byte, possibleCertLengths[rand.Intn(len(possibleCertLengths))])
+		common.RandRead(randSource, cert)
+
+		var nonce [12]byte
+		common.RandRead(randSource, nonce[:])
+		encryptedSessionKey, err := common.AESGCMEncrypt(nonce[:], sharedSecret[:], sessionKey[:])
+		if err != nil {
+			return
+		}
+		var encryptedSessionKeyArr [48]byte
+		copy(encryptedSessionKeyArr[:], encryptedSessionKey)
+
+		reply := composeReply(clientHelloSessionId, nonce, encryptedSessionKeyArr, cert)
+		_, err = originalConn.Write(reply)
+		if err != nil {
+			err = fmt.Errorf("failed to write TLS reply: %v", err)
+			originalConn.Close()
+			return
+		}
+		preparedConn = common.NewTLSConn(originalConn)
+		return
 	}
-	return ret
+	return respond
 }
 
-// ComposeReply composes the ServerHello, ChangeCipherSpec and Finished messages
-// together with their respective record layers into one byte slice. The content
-// of these messages are random and useless for this plugin
-func ComposeReply(ch *ClientHello) []byte {
-	TLS12 := []byte{0x03, 0x03}
-	shBytes := AddRecordLayer(composeServerHello(ch), []byte{0x16}, TLS12)
-	ccsBytes := AddRecordLayer([]byte{0x01}, []byte{0x14}, TLS12)
-	finished := make([]byte, 64)
-	finished = util.PsudoRandBytes(40, time.Now().UnixNano())
-	fBytes := AddRecordLayer(finished, []byte{0x16}, TLS12)
-	ret := append(shBytes, ccsBytes...)
-	ret = append(ret, fBytes...)
-	return ret
+func (TLS) unmarshalClientHello(ch *ClientHello, staticPv crypto.PrivateKey) (fragments authFragments, err error) {
+	copy(fragments.randPubKey[:], ch.random)
+	ephPub, ok := ecdh.Unmarshal(fragments.randPubKey[:])
+	if !ok {
+		err = ErrInvalidPubKey
+		return
+	}
+
+	copy(fragments.sharedSecret[:], ecdh.GenerateSharedSecret(staticPv, ephPub))
+	var keyShare []byte
+	keyShare, err = parseKeyShare(ch.extensions[[2]byte{0x00, 0x33}])
+	if err != nil {
+		return
+	}
+
+	ctxTag := append(ch.sessionId, keyShare...)
+	if len(ctxTag) != 64 {
+		err = fmt.Errorf("%v: %v", ErrCiphertextLength, len(ctxTag))
+		return
+	}
+	copy(fragments.ciphertextWithTag[:], ctxTag)
+	return
 }

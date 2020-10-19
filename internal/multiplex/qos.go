@@ -7,41 +7,60 @@ import (
 )
 
 // Valve needs to be universal, across all sessions that belong to a user
-// gabe please don't sue
-type Valve struct {
-	// traffic directions from the server's perspective are refered
+type LimitedValve struct {
+	// traffic directions from the server's perspective are referred
 	// exclusively as rx and tx.
 	// rx is from client to server, tx is from server to client
 	// DO NOT use terms up or down as this is used in usermanager
 	// for bandwidth limiting
-	rxtb atomic.Value // *ratelimit.Bucket
-	txtb atomic.Value // *ratelimit.Bucket
+	rxtb *ratelimit.Bucket
+	txtb *ratelimit.Bucket
 
-	rxCredit *int64
-	txCredit *int64
+	rx *int64
+	tx *int64
 }
 
-func MakeValve(rxRate, txRate int64, rxCredit, txCredit *int64) *Valve {
-	v := &Valve{
-		rxCredit: rxCredit,
-		txCredit: txCredit,
+type UnlimitedValve struct{}
+
+func MakeValve(rxRate, txRate int64) *LimitedValve {
+	var rx, tx int64
+	v := &LimitedValve{
+		rxtb: ratelimit.NewBucketWithRate(float64(rxRate), rxRate),
+		txtb: ratelimit.NewBucketWithRate(float64(txRate), txRate),
+		rx:   &rx,
+		tx:   &tx,
 	}
-	v.SetRxRate(rxRate)
-	v.SetTxRate(txRate)
 	return v
 }
 
-func (v *Valve) SetRxRate(rate int64) { v.rxtb.Store(ratelimit.NewBucketWithRate(float64(rate), rate)) }
-func (v *Valve) SetTxRate(rate int64) { v.txtb.Store(ratelimit.NewBucketWithRate(float64(rate), rate)) }
-func (v *Valve) rxWait(n int)         { v.rxtb.Load().(*ratelimit.Bucket).Wait(int64(n)) }
-func (v *Valve) txWait(n int)         { v.txtb.Load().(*ratelimit.Bucket).Wait(int64(n)) }
-func (v *Valve) SetRxCredit(n int64)  { atomic.StoreInt64(v.rxCredit, n) }
-func (v *Valve) SetTxCredit(n int64)  { atomic.StoreInt64(v.txCredit, n) }
-func (v *Valve) GetRxCredit() int64   { return atomic.LoadInt64(v.rxCredit) }
-func (v *Valve) GetTxCredit() int64   { return atomic.LoadInt64(v.txCredit) }
+var UNLIMITED_VALVE = &UnlimitedValve{}
 
-// n can be negative
-func (v *Valve) AddRxCredit(n int64) int64 { return atomic.AddInt64(v.rxCredit, n) }
+func (v *LimitedValve) rxWait(n int)  { v.rxtb.Wait(int64(n)) }
+func (v *LimitedValve) txWait(n int)  { v.txtb.Wait(int64(n)) }
+func (v *LimitedValve) AddRx(n int64) { atomic.AddInt64(v.rx, n) }
+func (v *LimitedValve) AddTx(n int64) { atomic.AddInt64(v.tx, n) }
+func (v *LimitedValve) GetRx() int64  { return atomic.LoadInt64(v.rx) }
+func (v *LimitedValve) GetTx() int64  { return atomic.LoadInt64(v.tx) }
+func (v *LimitedValve) Nullify() (int64, int64) {
+	rx := atomic.SwapInt64(v.rx, 0)
+	tx := atomic.SwapInt64(v.tx, 0)
+	return rx, tx
+}
 
-// n can be negative
-func (v *Valve) AddTxCredit(n int64) int64 { return atomic.AddInt64(v.txCredit, n) }
+func (v *UnlimitedValve) rxWait(n int)            {}
+func (v *UnlimitedValve) txWait(n int)            {}
+func (v *UnlimitedValve) AddRx(n int64)           {}
+func (v *UnlimitedValve) AddTx(n int64)           {}
+func (v *UnlimitedValve) GetRx() int64            { return 0 }
+func (v *UnlimitedValve) GetTx() int64            { return 0 }
+func (v *UnlimitedValve) Nullify() (int64, int64) { return 0, 0 }
+
+type Valve interface {
+	rxWait(n int)
+	txWait(n int)
+	AddRx(n int64)
+	AddTx(n int64)
+	GetRx() int64
+	GetTx() int64
+	Nullify() (int64, int64)
+}

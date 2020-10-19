@@ -2,132 +2,229 @@ package server
 
 import (
 	"crypto"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/cbeuw/Cloak/internal/common"
+	"github.com/cbeuw/Cloak/internal/server/usermanager"
 	"io/ioutil"
+	"net"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/cbeuw/Cloak/internal/server/usermanager"
 )
 
-type rawConfig struct {
-	WebServerAddr string
-	PrivateKey    string
-	AdminUID      string
+type RawConfig struct {
+	ProxyBook     map[string][]string
+	BindAddr      []string
+	BypassUID     [][]byte
+	RedirAddr     string
+	PrivateKey    []byte
+	AdminUID      []byte
 	DatabasePath  string
-	BackupDirPath string
+	StreamTimeout int
+	KeepAlive     int
+	CncMode       bool
 }
 
 // State type stores the global state of the program
 type State struct {
-	SS_LOCAL_HOST  string
-	SS_LOCAL_PORT  string
-	SS_REMOTE_HOST string
-	SS_REMOTE_PORT string
+	ProxyBook   map[string]net.Addr
+	ProxyDialer common.Dialer
 
-	Now         func() time.Time
-	AdminUID    []byte
-	staticPv    crypto.PrivateKey
-	Userpanel   *usermanager.Userpanel
+	WorldState common.WorldState
+	AdminUID   []byte
+	Timeout    time.Duration
+	//KeepAlive time.Duration
+
+	BypassUID map[[16]byte]struct{}
+	StaticPv  crypto.PrivateKey
+
+	// TODO: this doesn't have to be a net.Addr; resolution is done in Dial automatically
+	RedirHost   net.Addr
+	RedirPort   string
+	RedirDialer common.Dialer
+
 	usedRandomM sync.RWMutex
-	usedRandom  map[[32]byte]int
+	UsedRandom  map[[32]byte]int64
 
-	WebServerAddr string
+	Panel *userPanel
 }
 
-func InitState(localHost, localPort, remoteHost, remotePort string, nowFunc func() time.Time) (*State, error) {
-	ret := &State{
-		SS_LOCAL_HOST:  localHost,
-		SS_LOCAL_PORT:  localPort,
-		SS_REMOTE_HOST: remoteHost,
-		SS_REMOTE_PORT: remotePort,
-		Now:            nowFunc,
-	}
-	ret.usedRandom = make(map[[32]byte]int)
-	return ret, nil
-}
-
-// semi-colon separated value.
-func ssvToJson(ssv string) (ret []byte) {
-	unescape := func(s string) string {
-		r := strings.Replace(s, `\\`, `\`, -1)
-		r = strings.Replace(r, `\=`, `=`, -1)
-		r = strings.Replace(r, `\;`, `;`, -1)
-		return r
-	}
-	lines := strings.Split(unescape(ssv), ";")
-	ret = []byte("{")
-	for _, ln := range lines {
-		if ln == "" {
-			break
+func parseRedirAddr(redirAddr string) (net.Addr, string, error) {
+	var host string
+	var port string
+	colonSep := strings.Split(redirAddr, ":")
+	if len(colonSep) > 1 {
+		if len(colonSep) == 2 {
+			// domain or ipv4 with port
+			host = colonSep[0]
+			port = colonSep[1]
+		} else {
+			if strings.Contains(redirAddr, "[") {
+				// ipv6 with port
+				port = colonSep[len(colonSep)-1]
+				host = strings.TrimSuffix(redirAddr, "]:"+port)
+				host = strings.TrimPrefix(host, "[")
+			} else {
+				// ipv6 without port
+				host = redirAddr
+			}
 		}
-		sp := strings.SplitN(ln, "=", 2)
-		key := sp[0]
-		value := sp[1]
-		ret = append(ret, []byte(`"`+key+`":"`+value+`",`)...)
-
-	}
-	ret = ret[:len(ret)-1] // remove the last comma
-	ret = append(ret, '}')
-	return ret
-}
-
-// ParseConfig parses the config (either a path to json or in-line ssv config) into a State variable
-func (sta *State) ParseConfig(conf string) (err error) {
-	var content []byte
-	if strings.Contains(conf, ";") && strings.Contains(conf, "=") {
-		content = ssvToJson(conf)
 	} else {
-		content, err = ioutil.ReadFile(conf)
-		if err != nil {
-			return err
-		}
+		// domain or ipv4 without port
+		host = redirAddr
 	}
 
-	var preParse rawConfig
-	err = json.Unmarshal(content, &preParse)
+	redirHost, err := net.ResolveIPAddr("ip", host)
 	if err != nil {
-		return errors.New("Failed to unmarshal: " + err.Error())
+		return nil, "", fmt.Errorf("unable to resolve RedirAddr: %v. ", err)
 	}
-
-	up, err := usermanager.MakeUserpanel(preParse.DatabasePath, preParse.BackupDirPath)
-	if err != nil {
-		return errors.New("Attempting to open database: " + err.Error())
-	}
-	sta.Userpanel = up
-
-	sta.WebServerAddr = preParse.WebServerAddr
-
-	pvBytes, err := base64.StdEncoding.DecodeString(preParse.PrivateKey)
-	if err != nil {
-		return errors.New("Failed to decode private key: " + err.Error())
-	}
-	var pv [32]byte
-	copy(pv[:], pvBytes)
-	sta.staticPv = &pv
-
-	adminUID, err := base64.StdEncoding.DecodeString(preParse.AdminUID)
-	if err != nil {
-		return errors.New("Failed to decode AdminUID: " + err.Error())
-	}
-	sta.AdminUID = adminUID
-	return nil
+	return redirHost, port, nil
 }
 
-// UsedRandomCleaner clears the cache of used random fields every 12 hours
+func parseProxyBook(bookEntries map[string][]string) (map[string]net.Addr, error) {
+	proxyBook := map[string]net.Addr{}
+	for name, pair := range bookEntries {
+		name = strings.ToLower(name)
+		if len(pair) != 2 {
+			return nil, fmt.Errorf("invalid proxy endpoint and address pair for %v: %v", name, pair)
+		}
+		network := strings.ToLower(pair[0])
+		switch network {
+		case "tcp":
+			addr, err := net.ResolveTCPAddr("tcp", pair[1])
+			if err != nil {
+				return nil, err
+			}
+			proxyBook[name] = addr
+			continue
+		case "udp":
+			addr, err := net.ResolveUDPAddr("udp", pair[1])
+			if err != nil {
+				return nil, err
+			}
+			proxyBook[name] = addr
+			continue
+		}
+	}
+	return proxyBook, nil
+}
+
+// ParseConfig reads the config file or semicolon-separated options and parse them into a RawConfig
+func ParseConfig(conf string) (raw RawConfig, err error) {
+	content, errPath := ioutil.ReadFile(conf)
+	if errPath != nil {
+		errJson := json.Unmarshal(content, &raw)
+		if errJson != nil {
+			err = fmt.Errorf("failed to read/unmarshal configuration, path is invalid or %v", errJson)
+			return
+		}
+	} else {
+		errJson := json.Unmarshal(content, &raw)
+		if errJson != nil {
+			err = fmt.Errorf("failed to read configuration file: %v", errJson)
+			return
+		}
+	}
+	if raw.ProxyBook == nil {
+		raw.ProxyBook = make(map[string][]string)
+	}
+	return
+}
+
+// InitState process the RawConfig and initialises a server State accordingly
+func InitState(preParse RawConfig, worldState common.WorldState) (sta *State, err error) {
+	sta = &State{
+		BypassUID:   make(map[[16]byte]struct{}),
+		ProxyBook:   map[string]net.Addr{},
+		UsedRandom:  map[[32]byte]int64{},
+		RedirDialer: &net.Dialer{},
+		WorldState:  worldState,
+	}
+	if preParse.CncMode {
+		err = errors.New("command & control mode not implemented")
+		return
+	} else {
+		manager, err := usermanager.MakeLocalManager(preParse.DatabasePath, worldState)
+		if err != nil {
+			return sta, err
+		}
+		sta.Panel = MakeUserPanel(manager)
+	}
+
+	if preParse.StreamTimeout == 0 {
+		sta.Timeout = time.Duration(300) * time.Second
+	} else {
+		sta.Timeout = time.Duration(preParse.StreamTimeout) * time.Second
+	}
+
+	if preParse.KeepAlive <= 0 {
+		sta.ProxyDialer = &net.Dialer{KeepAlive: -1}
+	} else {
+		sta.ProxyDialer = &net.Dialer{KeepAlive: time.Duration(preParse.KeepAlive) * time.Second}
+	}
+
+	sta.RedirHost, sta.RedirPort, err = parseRedirAddr(preParse.RedirAddr)
+	if err != nil {
+		err = fmt.Errorf("unable to parse RedirAddr: %v", err)
+		return
+	}
+
+	sta.ProxyBook, err = parseProxyBook(preParse.ProxyBook)
+	if err != nil {
+		err = fmt.Errorf("unable to parse ProxyBook: %v", err)
+		return
+	}
+
+	var pv [32]byte
+	copy(pv[:], preParse.PrivateKey)
+	sta.StaticPv = &pv
+
+	sta.AdminUID = preParse.AdminUID
+
+	var arrUID [16]byte
+	for _, UID := range preParse.BypassUID {
+		copy(arrUID[:], UID)
+		sta.BypassUID[arrUID] = struct{}{}
+	}
+	copy(arrUID[:], sta.AdminUID)
+	sta.BypassUID[arrUID] = struct{}{}
+
+	go sta.UsedRandomCleaner()
+	return sta, nil
+}
+
+// IsBypass checks if a UID is a bypass user
+func (sta *State) IsBypass(UID []byte) bool {
+	var arrUID [16]byte
+	copy(arrUID[:], UID)
+	_, exist := sta.BypassUID[arrUID]
+	return exist
+}
+
+const TIMESTAMP_TOLERANCE = 180 * time.Second
+
+const CACHE_CLEAN_INTERVAL = 12 * time.Hour
+
+// UsedRandomCleaner clears the cache of used random fields every CACHE_CLEAN_INTERVAL
 func (sta *State) UsedRandomCleaner() {
 	for {
-		time.Sleep(12 * time.Hour)
-		now := int(sta.Now().Unix())
+		time.Sleep(CACHE_CLEAN_INTERVAL)
 		sta.usedRandomM.Lock()
-		for key, t := range sta.usedRandom {
-			if now-t > 12*3600 {
-				delete(sta.usedRandom, key)
+		for key, t := range sta.UsedRandom {
+			if time.Unix(t, 0).Before(sta.WorldState.Now().Add(TIMESTAMP_TOLERANCE)) {
+				delete(sta.UsedRandom, key)
 			}
 		}
 		sta.usedRandomM.Unlock()
 	}
+}
+
+func (sta *State) registerRandom(r [32]byte) bool {
+	sta.usedRandomM.Lock()
+	_, used := sta.UsedRandom[r]
+	sta.UsedRandom[r] = sta.WorldState.Now().Unix()
+	sta.usedRandomM.Unlock()
+	return used
 }

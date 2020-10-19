@@ -2,160 +2,178 @@ package multiplex
 
 import (
 	"errors"
-	"log"
+	log "github.com/sirupsen/logrus"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
 )
 
-// switchboard is responsible for keeping the reference of TLS connections between client and server
+const (
+	FIXED_CONN_MAPPING switchboardStrategy = iota
+	UNIFORM_SPREAD
+)
+
+// switchboard is responsible for managing TCP connections between client and server.
+// It has several purposes: constantly receiving incoming data from all connections
+// and pass them to Session.recvDataFromRemote(); accepting data through
+// switchboard.send(), in which it selects a connection according to its
+// switchboardStrategy and send the data off using that; and counting, as well as
+// rate limiting, data received and sent through its Valve.
 type switchboard struct {
 	session *Session
 
-	*Valve
+	valve    Valve
+	strategy switchboardStrategy
 
-	// optimum is the connEnclave with the smallest sendQueue
-	optimum atomic.Value // *connEnclave
-	cesM    sync.RWMutex
-	ces     []*connEnclave
+	// map of connId to net.Conn
+	conns      sync.Map
+	numConns   uint32
+	nextConnId uint32
+
+	broken uint32
 }
 
-func (sb *switchboard) getOptimum() *connEnclave {
-	if i := sb.optimum.Load(); i == nil {
-		return nil
+func makeSwitchboard(sesh *Session) *switchboard {
+	var strategy switchboardStrategy
+	if sesh.Unordered {
+		log.Debug("Connection is unordered")
+		strategy = UNIFORM_SPREAD
 	} else {
-		return i.(*connEnclave)
+		strategy = FIXED_CONN_MAPPING
 	}
-}
-
-// Some data comes from a Stream to be sent through one of the many
-// remoteConn, but which remoteConn should we use to send the data?
-//
-// In this case, we pick the remoteConn that has about the smallest sendQueue.
-type connEnclave struct {
-	remoteConn net.Conn
-	sendQueue  uint32
-}
-
-func makeSwitchboard(sesh *Session, valve *Valve) *switchboard {
-	// rates are uint64 because in the usermanager we want the bandwidth to be atomically
-	// operated (so that the bandwidth can change on the fly).
 	sb := &switchboard{
-		session: sesh,
-		Valve:   valve,
-		ces:     []*connEnclave{},
+		session:    sesh,
+		strategy:   strategy,
+		valve:      sesh.Valve,
+		nextConnId: 1,
 	}
 	return sb
 }
 
-var errNilOptimum error = errors.New("The optimal connection is nil")
+var errBrokenSwitchboard = errors.New("the switchboard is broken")
 
-var ErrNoRxCredit error = errors.New("No Rx credit is left")
-var ErrNoTxCredit error = errors.New("No Tx credit is left")
-
-func (sb *switchboard) send(data []byte) (int, error) {
-	ce := sb.getOptimum()
-	if ce == nil {
-		return 0, errNilOptimum
-	}
-	atomic.AddUint32(&ce.sendQueue, uint32(len(data)))
-	go sb.updateOptimum()
-	n, err := ce.remoteConn.Write(data)
-	if err != nil {
-		return n, err
-	}
-	sb.txWait(n)
-	if sb.AddTxCredit(-int64(n)) < 0 {
-		log.Println(ErrNoTxCredit)
-		go sb.session.Close()
-		return n, ErrNoTxCredit
-	}
-	atomic.AddUint32(&ce.sendQueue, ^uint32(n-1))
-	go sb.updateOptimum()
-	return n, nil
-}
-
-func (sb *switchboard) updateOptimum() {
-	currentOpti := sb.getOptimum()
-	currentOptiQ := atomic.LoadUint32(&currentOpti.sendQueue)
-	sb.cesM.RLock()
-	for _, ce := range sb.ces {
-		ceQ := atomic.LoadUint32(&ce.sendQueue)
-		if ceQ < currentOptiQ {
-			currentOpti = ce
-			currentOptiQ = ceQ
-		}
-	}
-	sb.cesM.RUnlock()
-	sb.optimum.Store(currentOpti)
+func (sb *switchboard) connsCount() int {
+	return int(atomic.LoadUint32(&sb.numConns))
 }
 
 func (sb *switchboard) addConn(conn net.Conn) {
-	var sendQueue uint32
-	newCe := &connEnclave{
-		remoteConn: conn,
-		sendQueue:  sendQueue,
-	}
-	sb.cesM.Lock()
-	sb.ces = append(sb.ces, newCe)
-	sb.cesM.Unlock()
-	sb.optimum.Store(newCe)
-	go sb.deplex(newCe)
+	connId := atomic.AddUint32(&sb.nextConnId, 1) - 1
+	atomic.AddUint32(&sb.numConns, 1)
+	sb.conns.Store(connId, conn)
+	go sb.deplex(connId, conn)
 }
 
-func (sb *switchboard) removeConn(closing *connEnclave) {
-	sb.cesM.Lock()
-	for i, ce := range sb.ces {
-		if closing == ce {
-			sb.ces = append(sb.ces[:i], sb.ces[i+1:]...)
-			break
+// a pointer to connId is passed here so that the switchboard can reassign it if that connId isn't usable
+func (sb *switchboard) send(data []byte, connId *uint32) (n int, err error) {
+	writeAndRegUsage := func(conn net.Conn, d []byte) (int, error) {
+		n, err = conn.Write(d)
+		if err != nil {
+			sb.conns.Delete(*connId)
+			sb.close("failed to write to remote " + err.Error())
+			return n, err
 		}
+		sb.valve.AddTx(int64(n))
+		return n, nil
 	}
-	if len(sb.ces) == 0 {
-		sb.session.Close()
+
+	sb.valve.txWait(len(data))
+	if atomic.LoadUint32(&sb.broken) == 1 || sb.connsCount() == 0 {
+		return 0, errBrokenSwitchboard
 	}
-	sb.cesM.Unlock()
+
+	switch sb.strategy {
+	case UNIFORM_SPREAD:
+		_, conn, err := sb.pickRandConn()
+		if err != nil {
+			return 0, errBrokenSwitchboard
+		}
+		return writeAndRegUsage(conn, data)
+	case FIXED_CONN_MAPPING:
+		connI, ok := sb.conns.Load(*connId)
+		if ok {
+			conn := connI.(net.Conn)
+			return writeAndRegUsage(conn, data)
+		} else {
+			newConnId, conn, err := sb.pickRandConn()
+			if err != nil {
+				return 0, errBrokenSwitchboard
+			}
+			*connId = newConnId
+			return writeAndRegUsage(conn, data)
+		}
+	default:
+		return 0, errors.New("unsupported traffic distribution strategy")
+	}
+}
+
+// returns a random connId
+func (sb *switchboard) pickRandConn() (uint32, net.Conn, error) {
+	connCount := sb.connsCount()
+	if atomic.LoadUint32(&sb.broken) == 1 || connCount == 0 {
+		return 0, nil, errBrokenSwitchboard
+	}
+
+	// there is no guarantee that sb.conns still has the same amount of entries
+	// between the count loop and the pick loop
+	// so if the r > len(sb.conns) at the point of range call, the last visited element is picked
+	var id uint32
+	var conn net.Conn
+	r := rand.Intn(connCount)
+	var c int
+	sb.conns.Range(func(connIdI, connI interface{}) bool {
+		if r == c {
+			id = connIdI.(uint32)
+			conn = connI.(net.Conn)
+			return false
+		}
+		c++
+		return true
+	})
+	// if len(sb.conns) is 0
+	if conn == nil {
+		return 0, nil, errBrokenSwitchboard
+	}
+	return id, conn, nil
+}
+
+func (sb *switchboard) close(terminalMsg string) {
+	atomic.StoreUint32(&sb.broken, 1)
+	if !sb.session.IsClosed() {
+		sb.session.SetTerminalMsg(terminalMsg)
+		sb.session.passiveClose()
+	}
 }
 
 // actively triggered by session.Close()
 func (sb *switchboard) closeAll() {
-	sb.cesM.RLock()
-	for _, ce := range sb.ces {
-		ce.remoteConn.Close()
-	}
-	sb.cesM.RUnlock()
+	sb.conns.Range(func(key, connI interface{}) bool {
+		conn := connI.(net.Conn)
+		conn.Close()
+		sb.conns.Delete(key)
+		return true
+	})
 }
 
-// deplex function costantly reads from a TCP connection, call deobfs and distribute it
-// to the corresponding stream
-func (sb *switchboard) deplex(ce *connEnclave) {
-	buf := make([]byte, 20480)
+// deplex function costantly reads from a TCP connection
+func (sb *switchboard) deplex(connId uint32, conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, sb.session.ConnReceiveBufferSize)
 	for {
-		n, err := sb.session.obfsedRead(ce.remoteConn, buf)
-		sb.rxWait(n)
+		n, err := conn.Read(buf)
+		sb.valve.rxWait(n)
+		sb.valve.AddRx(int64(n))
 		if err != nil {
-			//log.Println(err)
-			go ce.remoteConn.Close()
-			sb.removeConn(ce)
+			log.Debugf("a connection for session %v has closed: %v", sb.session.id, err)
+			sb.conns.Delete(connId)
+			atomic.AddUint32(&sb.numConns, ^uint32(0))
+			sb.close("a connection has dropped unexpectedly")
 			return
-		}
-		if sb.AddRxCredit(-int64(n)) < 0 {
-			log.Println(ErrNoRxCredit)
-			sb.session.Close()
-			return
-		}
-		frame, err := sb.session.deobfs(buf[:n])
-		if err != nil {
-			log.Println(err)
-			continue
 		}
 
-		stream := sb.session.getStream(frame.StreamID, frame.Closing == 1)
-		// if the frame is telling us to close a closed stream
-		// (this happens when ss-server and ss-local closes the stream
-		// simutaneously), we don't do anything
-		if stream != nil {
-			stream.writeNewFrame(frame)
+		err = sb.session.recvDataFromRemote(buf[:n])
+		if err != nil {
+			log.Error(err)
 		}
 	}
 }
